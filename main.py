@@ -462,9 +462,168 @@ def experiment_2(
     print("Saved: figures/e2_acc_vs_k_updated.png")
 
 # ========== E3 :  ========== #
+# ========== E3 : Incremental Enhancement Nodes (Column Updates) ========== #
+def experiment_3(
+    seeds=tuple(range(10)),    # Kellinger-style: 10 runs
+    npw=100,                   # fixed feature size
+    mp=MP,                     # 100 per window (reuse your global)
+    base_mw=20,
+    target_mw=30,
+    schedules=dict(
+        V1=[2,2,2,2,2],       # 20→22→24→26→28→30
+        V2=[5,5],             # 20→25→30
+        V3=[10],              # 20→30
+    ),
+    ridge=None,                # if None -> use max(RIDGE, 1e-3)
+):
+    """
+    E3: Incremental column updates by adding enhancement windows.
+    Compares 'direct', 'greville', 'updated_greville' across three schedules (V1/V2/V3).
+    Outputs: console summaries + simple plots (accuracy vs total windows) per schedule.
+    """
+    import os, numpy as np, matplotlib.pyplot as plt, pandas as pd
+    os.makedirs("results", exist_ok=True)
+    os.makedirs("figures", exist_ok=True)
+
+    lam = max(RIDGE, 1e-3) if ridge is None else ridge
+
+    # Load MNIST once
+    X_tr_full, y_tr_full, X_te, y_te = load_mnist(flatten=True)
+    Y_tr_full = to_onehot(y_tr_full, 10)
+
+    def make_blocks(feat_dim, inc_list, rng):
+        """Create a list of enhancement-window blocks; each item is (Ws_block, bs_block) for Δmw windows."""
+        blocks = []
+        for dmw in inc_list:
+            Ws_blk, bs_blk = init_enh_layer(feat_dim=feat_dim, mp_per_win=mp, mw=dmw, rng=rng)
+            blocks.append((Ws_blk, bs_blk))
+        return blocks
+
+    def forward_enh_with_lists(Z, Ws_list, bs_list, steps, rng):
+        """Concatenate enhancement outputs from all windows in the lists."""
+        return forward_enh_layer(Z, Ws_list, bs_list, steps, rng)
+
+    # Collect all rows for aggregation/plotting
+    rows = []  # dict(method, schedule, total_mw, seed, acc, step_time)
+
+    print("\n== E3: Incremental Enhancement Nodes (Column Updates) ==")
+    for schedule_name, inc_list in schedules.items():
+        print(f"\n-- Schedule {schedule_name}: base={base_mw}, increments={inc_list}, target={target_mw} --")
+
+        # For reproducibility across methods, we will (per seed):
+        #   - build Z once
+        #   - build base enhancement windows once
+        #   - pre-generate the same sequence of increment blocks (Ws/bs) and reuse them for all methods
+        for seed in seeds:
+            set_seed(seed)
+            rng = np.random.RandomState(seed)
+
+            # Features: Z built once (full 60k)
+            Ws_f, bs_f = init_feature_layer(in_dim=X_tr_full.shape[1], np_per_win=npw, nw=NW, rng=rng)
+            Z = forward_feature_layer(X_tr_full, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
+
+            # Base enhancement windows (mw=base_mw)
+            Ws_base, bs_base = init_enh_layer(feat_dim=Z.shape[1], mp_per_win=mp, mw=base_mw, rng=rng)
+
+            # Pre-generate increment blocks and keep them identical for all methods
+            blocks = make_blocks(feat_dim=Z.shape[1], inc_list=inc_list, rng=rng)
+
+            # Methods to compare
+            for method in ("direct", "greville", "updated_greville"):
+                # Start from base state each time for fairness
+                Ws_cum = list(Ws_base)  # shallow copies are fine (we append lists)
+                bs_cum = list(bs_base)
+
+                # We measure step time as: (compute H_cum) + (update A^+) + (solve W)
+                # Z^+ is constant per seed/method (since Z doesn't change)
+                Z_pinv = pinv_ridge_np(Z, lam=lam)
+
+                total_mw_running = base_mw
+                for (Ws_blk, bs_blk) in blocks:
+                    # Append this block
+                    Ws_cum += Ws_blk
+                    bs_cum += bs_blk
+                    total_mw_running += len(Ws_blk)  # Δmw
+
+                    # Step timing
+                    with Timer() as t_step:
+                        # Build cumulative H
+                        H_cum = forward_enh_with_lists(Z, Ws_cum, bs_cum, steps=SPIKE_STEPS, rng=rng)
+                        # Column partition update (or direct recompute)
+                        A, A_pinv = extend_columns_with_backend(method, Z, Z_pinv, H_cum, lam=lam)
+                        # Solve and evaluate
+                        W_out = (A_pinv @ Y_tr_full).astype(np.float32)
+                    step_time = t_step.elapsed
+
+                    # Evaluate on test
+                    Zt = forward_feature_layer(X_te, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
+                    Ht = forward_enh_with_lists(Zt, Ws_cum, bs_cum, steps=SPIKE_STEPS, rng=rng)
+                    At = np.concatenate([Zt, Ht], axis=1).astype(np.float32)
+                    y_pred = np.argmax(At @ W_out, axis=1)
+                    acc = float((y_pred == y_te).mean())
+
+                    rows.append(dict(
+                        schedule=schedule_name,
+                        method=method,
+                        seed=seed,
+                        total_mw=total_mw_running,
+                        acc=acc,
+                        step_time=step_time
+                    ))
+
+        # After finishing all seeds & methods for this schedule, print quick summary at final capacity
+        df_sched = pd.DataFrame([r for r in rows if r["schedule"] == schedule_name])
+        df_final = df_sched[df_sched["total_mw"] == target_mw]
+        print("  Final (mw=30) accuracy mean ± std:")
+        for m in ("direct","greville","updated_greville"):
+            sub = df_final[df_final["method"] == m]["acc"]
+            if not sub.empty:
+                print(f"    {m:16s} {sub.mean()*100:5.2f}% ± {sub.std()*100:4.2f}%")
+
+    # ---------- Aggregate & Plot (Accuracy vs total windows) ----------
+    df = pd.DataFrame(rows)
+    df["acc_pct"] = df["acc"] * 100
+
+    # Save a tidy CSV for later analysis
+    df.sort_values(["schedule","method","total_mw","seed"]).to_csv("results/e3_rows.csv", index=False)
+    print("Saved: results/e3_rows.csv")
+
+    # One figure per schedule
+    for schedule_name in schedules.keys():
+        d = df[df["schedule"] == schedule_name]
+        if d.empty: 
+            continue
+        plt.figure(figsize=(7,4), dpi=140)
+        for m in ("direct","greville","updated_greville"):
+            sub = (d[d["method"] == m]
+                   .groupby("total_mw")["acc_pct"].mean()
+                   .reset_index()
+                   .sort_values("total_mw"))
+            if sub.empty: 
+                continue
+            plt.plot(sub["total_mw"], sub["acc_pct"], marker="o", label=m)
+        plt.xlabel("Total enhancement windows (mw)")
+        plt.ylabel("Accuracy (%)")
+        plt.title(f"E3: Accuracy vs mw — {schedule_name}")
+        plt.grid(alpha=0.2); plt.legend(); plt.tight_layout()
+        plt.savefig(f"figures/e3_acc_vs_mw_{schedule_name}.png"); plt.close()
+        print(f"Saved: figures/e3_acc_vs_mw_{schedule_name}.png")
+
+    # Optional: summarize cumulative time per schedule/method at final mw
+    df_final = df[df["total_mw"] == target_mw]
+    if not df_final.empty:
+        print("\nE3 — Final mw cumulative step time (mean ± std) [approx; per-step times summed offline if desired]")
+        # quick per-method mean step time at final step (not cumulative)
+        for schedule_name in schedules.keys():
+            for m in ("direct","greville","updated_greville"):
+                sub = df_final[(df_final["schedule"]==schedule_name) & (df_final["method"]==m)]["step_time"]
+                if not sub.empty:
+                    print(f"{schedule_name:>3s} | {m:16s} time={sub.mean():.2f}s ± {sub.std():.2f}s")
+
+    print("\n[E3] Done.")
 
 
 if __name__ == "__main__":
     #experiment_1()
-    experiment_2()
-
+    #experiment_2()
+    experiment_3()
