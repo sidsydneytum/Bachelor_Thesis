@@ -743,7 +743,6 @@ def experiment_3(
 
 # ---------------- Runner ---------------- #
 if __name__ == "__main__":
-    ensure_dirs()
     # experiment_1()
     experiment_2()
     # experiment_3()
