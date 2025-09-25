@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+.venv38/
+
+# OS / notebooks
+.DS_Store
+.ipynb_checkpoints/
+
+# Project outputs
+results/
+figures/
+logs/
