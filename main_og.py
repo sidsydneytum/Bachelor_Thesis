@@ -5,36 +5,35 @@ import time
 import psutil
 import matplotlib.pyplot as plt
 import json
+import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
+import torch
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 from sklearn.metrics import confusion_matrix
 import numpy as np
 import pandas as pd
-
-# -------------------- GPU configuration -------------------- #
+# --------------------GPU configuration--------------------#
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 USE_GPU = (DEVICE.type == "cuda")
 print(f"Using device: {DEVICE}")
 
-# ------------------- Config ------------------- #
+# ------------------- Config -------------------#
 SEED = 0
 NPS = [50, 100]          # Number of features to select
 MWS = [10, 20]           # Enhancement windows
 UPDATERS = ["direct", "greville", "updated_greville"]  # Updater methods to compare
-MP = 100                 # Enhancement nodes per window
-NW = 1                   # Feature windows (as in Kellinger MNIST)
-SPIKE_STEPS = 30         # Number of spike steps
-RIDGE = 0.0              # Ridge regularization
+MP = 100  # Number of samples per window
+NW = 1  # Number of features to add per window, as Kellinger MNIST
+SPIKE_STEPS = 30  # Number of spike steps
+RIDGE = 0.0  # Ridge regularization
 MNIST_PATH = "./data/mnist"
 SAVE_DIR = "figures/confusionmatrix"
 
 #-------------------Utlities-------------------#
 def ensure_dirs():
     os.makedirs(SAVE_DIR, exist_ok=True)
-    os.makedirs("results", exist_ok=True)
-    os.makedirs("figures", exist_ok=True)
 
 def set_seed(seed: int = 0):
     random.seed(seed)
@@ -175,67 +174,6 @@ def forward_enh_layer(Z, Ws, bs, steps, rng):
     return np.concatenate(outs, axis=1).astype(np.float32)
 
 
-# =================== GPU helpers (Torch) =================== #
-def rate_code_torch(arr: torch.Tensor, steps: int) -> torch.Tensor:
-    N, D = arr.shape
-    probs = arr.unsqueeze(-1).expand(N, D, steps)
-    return (torch.rand((N, D, steps), device=arr.device, dtype=arr.dtype) < probs).to(arr.dtype)
-
-def aggregate_spikes_torch(spk: torch.Tensor) -> torch.Tensor:
-    s = spk.sum(dim=2)
-    mn = s.min(dim=1, keepdim=True).values
-    mx = s.max(dim=1, keepdim=True).values
-    return (s - mn) / (mx - mn + 1e-8)
-
-def lif_like_torch(x: torch.Tensor) -> torch.Tensor:
-    z = torch.tanh(x)
-    mn = z.min(dim=1, keepdim=True).values
-    mx = z.max(dim=1, keepdim=True).values
-    return (z - mn) / (mx - mn + 1e-8)
-
-def init_feature_layer_torch(in_dim, np_per_win, nw, rng_np, device):
-    Ws, bs = [], []
-    for _ in range(nw):
-        W = torch.tensor(rng_np.randn(in_dim, np_per_win).astype(np.float32) * 0.2, device=device)
-        b = torch.tensor((rng_np.rand(np_per_win).astype(np.float32) - 0.5) * 0.1, device=device)
-        Ws.append(W); bs.append(b)
-    return Ws, bs
-
-def init_enh_layer_torch(feat_dim, mp_per_win, mw, rng_np, device):
-    Ws, bs = [], []
-    for _ in range(mw):
-        W = torch.tensor(rng_np.randn(feat_dim, mp_per_win).astype(np.float32) * 0.2, device=device)
-        b = torch.tensor((rng_np.rand(mp_per_win).astype(np.float32) - 0.5) * 0.1, device=device)
-        Ws.append(W); bs.append(b)
-    return Ws, bs
-
-def forward_feature_layer_torch(X: torch.Tensor, Ws: list, bs: list, steps: int) -> torch.Tensor:
-    outs = []
-    for W, b in zip(Ws, bs):
-        lin = X @ W + b.unsqueeze(0)
-        mn = lin.min(dim=1, keepdim=True).values
-        mx = lin.max(dim=1, keepdim=True).values
-        norm = (lin - mn) / (mx - mn + 1e-8)
-        spk = rate_code_torch(norm, steps)
-        outs.append(aggregate_spikes_torch(spk))
-    return torch.cat(outs, dim=1).to(torch.float32)
-
-def forward_enh_layer_torch(Z: torch.Tensor, Ws: list, bs: list, steps: int) -> torch.Tensor:
-    outs = []
-    for W, b in zip(Ws, bs):
-        lin = Z @ W + b.unsqueeze(0)
-        z = lif_like_torch(lin)
-        spk = rate_code_torch(z, steps)
-        outs.append(aggregate_spikes_torch(spk))
-    return torch.cat(outs, dim=1).to(torch.float32)
-
-def pinv_ridge_torch(A: torch.Tensor, lam: float = 1e-3) -> torch.Tensor:
-    AtA = A.T @ A
-    n = AtA.shape[0]
-    I = torch.eye(n, dtype=A.dtype, device=A.device)
-    return torch.linalg.solve(AtA + lam * I, A.T)
-
-
 #-------------------Updaters wrappers-------------------#
 def extend_columns_with_backend(updater_name: str, Z: np.ndarray, Z_pinv: np.ndarray, H: np.ndarray, lam: float):
     """
@@ -282,7 +220,7 @@ def extend_columns_with_backend(updater_name: str, Z: np.ndarray, Z_pinv: np.nda
     A = np.concatenate([Z, H], axis=1)
     return A, pinv_ridge_np(A, lam)
 
-# ---------------- train & eval (GPU-aware) ---------------- #
+#-------------------one training pass-------------------#
 def train_and_eval(updater, npw, mw, seed=SEED):
     set_seed(seed)
     rng = np.random.RandomState(seed)
@@ -291,75 +229,37 @@ def train_and_eval(updater, npw, mw, seed=SEED):
     X_train, y_train, X_test, y_test = load_mnist(flatten=True)
     Y_train = to_onehot(y_train, 10)
 
-    if USE_GPU:
-        # ---- GPU path ----
-        Xtr_t = torch.from_numpy(X_train).to(DEVICE)
-        Xte_t = torch.from_numpy(X_test).to(DEVICE)
-
-        Ws_f_t, bs_f_t = init_feature_layer_torch(Xtr_t.shape[1], npw, NW, rng, DEVICE)
-        Z_t = forward_feature_layer_torch(Xtr_t, Ws_f_t, bs_f_t, SPIKE_STEPS)
-        Ws_h_t, bs_h_t = init_enh_layer_torch(Z_t.shape[1], MP, mw, rng, DEVICE)
-        H_t = forward_enh_layer_torch(Z_t, Ws_h_t, bs_h_t, SPIKE_STEPS)
-
-        mem_before = peak_mem_mb()
-        with Timer() as t:
-            if updater == "direct":
-                # full GPU solve
-                A_t = torch.cat([Z_t, H_t], dim=1)
-                A_pinv_t = pinv_ridge_torch(A_t, lam=max(RIDGE, 1e-3))
-                Ytr_t = torch.from_numpy(Y_train).to(DEVICE)
-                W_out_t = A_pinv_t @ Ytr_t
-            else:
-                # greville / updated_greville on CPU (NumPy); forward done on GPU
-                Z = Z_t.detach().cpu().numpy()
-                H = H_t.detach().cpu().numpy()
-                Z_pinv = pinv_ridge_np(Z, lam=max(RIDGE, 1e-3))
-                A, A_pinv = extend_columns_with_backend(updater, Z, Z_pinv, H, lam=max(RIDGE, 1e-3))
-                W_out = (A_pinv @ Y_train).astype(np.float32)
-        train_time = t.elapsed
-        mem_after = peak_mem_mb()
-        peak_mem = max(mem_before, mem_after)
-
-        # eval
-        Zte_t = forward_feature_layer_torch(Xte_t, Ws_f_t, bs_f_t, SPIKE_STEPS)
-        Hte_t = forward_enh_layer_torch(Zte_t, Ws_h_t, bs_h_t, SPIKE_STEPS)
-        if updater == "direct":
-            At_t = torch.cat([Zte_t, Hte_t], dim=1)
-            logits_t = At_t @ W_out_t
-            y_pred = logits_t.argmax(dim=1).detach().cpu().numpy()
-        else:
-            At = np.concatenate([Zte_t.detach().cpu().numpy(), Hte_t.detach().cpu().numpy()], axis=1).astype(np.float32)
-            logits = At @ W_out
-            y_pred = np.argmax(logits, axis=1)
-
-        acc = float((y_pred == y_test).mean())
-        cm = confusion_matrix(y_test, y_pred, labels=list(range(10)))
-        fname = f"confmat_{updater}_np{npw}_mw{mw}.png"
-        plot_confusionmatrix(cm, f"{updater}  np={npw}  mw={mw}", os.path.join(SAVE_DIR, fname))
-        return acc, train_time, peak_mem
-
-     # ---- CPU path (original) ----
+    # feature layer
     Ws_f, bs_f = init_feature_layer(in_dim=X_train.shape[1], np_per_win=npw, nw=NW, rng=rng)
-    Z = forward_feature_layer(X_train, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
+    Z = forward_feature_layer(X_train, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)  # (N, npw*NW)
+
+    # enhancement layer
     Ws_h, bs_h = init_enh_layer(feat_dim=Z.shape[1], mp_per_win=MP, mw=mw, rng=rng)
-    H = forward_enh_layer(Z, Ws_h, bs_h, steps=SPIKE_STEPS, rng=rng)
+    H = forward_enh_layer(Z, Ws_h, bs_h, steps=SPIKE_STEPS, rng=rng)         # (N, MP*mw)
+
+    # pseudoinverse: start from Z^+, extend with H via chosen backend (or fallback)
     mem_before = peak_mem_mb()
     with Timer() as t:
         Z_pinv = pinv_ridge_np(Z, lam=max(RIDGE, 1e-3))
         A, A_pinv = extend_columns_with_backend(updater, Z, Z_pinv, H, lam=max(RIDGE, 1e-3))
-        W_out = (A_pinv @ to_onehot(y_train, 10)).astype(np.float32)
+        W_out = (A_pinv @ Y_train).astype(np.float32)
     train_time = t.elapsed
     mem_after = peak_mem_mb()
-    peak_mem = max(mem_before, mem_after)
+    peak_mem = max(mem_before, mem_after)  # simple snapshot approximation
+
+    # evaluate (recompute features on test)
     Zt = forward_feature_layer(X_test, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
     Ht = forward_enh_layer(Zt, Ws_h, bs_h, steps=SPIKE_STEPS, rng=rng)
     At = np.concatenate([Zt, Ht], axis=1).astype(np.float32)
     logits = At @ W_out
     y_pred = np.argmax(logits, axis=1)
     acc = float((y_pred == y_test).mean())
+
+    # save confusion matrix (per setting)
     cm = confusion_matrix(y_test, y_pred, labels=list(range(10)))
     fname = f"confmat_{updater}_np{npw}_mw{mw}.png"
     plot_confusionmatrix(cm, f"{updater}  np={npw}  mw={mw}", os.path.join(SAVE_DIR, fname))
+
     return acc, train_time, peak_mem
 
 
@@ -446,7 +346,7 @@ def train_and_eval(updater, npw, mw, seed=SEED):
 #     _ = sanity_one_training_pass(npw=50, mw=10, seed=0)
 
 #-------------------main-------------------#
-# ===================== E1 ===================== #
+# ========== E1 : Feature & Enhancement Sizes (Capacity Sweep) =========== #
 def experiment_1():
     ensure_dirs()
     print("== E1: Capacity Sweep (np in {50,100}, mw in {10,20}) ==")
@@ -460,12 +360,18 @@ def experiment_1():
                 results.append(dict(updater=updater, np=npw, mw=mw, acc=acc, time=tsec, peak_mem_mb=pmem))
     with open("e1_minimal_summary.json", "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2)
+    
 
-# ===================== E2 (updated_greville only) ===================== #
+
+
+# ========== E2 : Training Set Size  =========== #
+
+# ========== E2 : Training Set Size (updated_greville only) ========== #
 def experiment_2(
     train_sizes=(5_000, 10_000, 30_000, 60_000),
     seeds=tuple(range(10)),      # 10 runs (iterations)
-    npw=100, mw=20
+    npw=100,                     # fixed capacity to isolate training-size effect
+    mw=20
 ):
     """
     E2: Influence of training set size using only updated_greville.
@@ -474,11 +380,11 @@ def experiment_2(
       - CSV: results/e2_table_accuracy_updated.csv
       - Figure (dots+line): figures/e2_acc_vs_k_updated.png
     """
-    ensure_dirs()
-    print("\n== E2: Training Set Size (updated_greville) ==")
-    X_tr_full, y_tr_full, X_te, y_te = load_mnist(flatten=True)
 
-    # stratified subset for balance & reproducibility
+    os.makedirs("results", exist_ok=True)
+    os.makedirs("figures", exist_ok=True)
+
+    # Balanced + reproducible subset selection (tiny helper kept inside)
     def _k_indices_stratified(y: np.ndarray, k: int, seed: int) -> np.ndarray:
         rng = np.random.RandomState(seed)
         per_class = {c: np.where(y == c)[0] for c in range(10)}
@@ -489,62 +395,47 @@ def experiment_2(
         rng.shuffle(idx)
         return idx
 
-    rows = []
+    print("\n== E2: Training Set Size (updated_greville) ==")
+    # Load once
+    X_tr_full, y_tr_full, X_te, y_te = load_mnist(flatten=True)
+
+    rows = []  # collect per-seed accuracies
     for k in train_sizes:
         accs = []
         for seed in seeds:
             set_seed(seed)
             rng = np.random.RandomState(seed)
+
+            # Subset
             idx = _k_indices_stratified(y_tr_full, k, seed)
             X_tr = X_tr_full[idx]; y_tr = y_tr_full[idx]
             Y_tr = to_onehot(y_tr, 10)
 
-            if USE_GPU:
-                Xtr_t = torch.from_numpy(X_tr).to(DEVICE)
-                Xte_t = torch.from_numpy(X_te).to(DEVICE)
+            # Random layers (fixed capacity)
+            Ws_f, bs_f = init_feature_layer(in_dim=X_tr.shape[1], np_per_win=npw, nw=NW, rng=rng)
+            Z = forward_feature_layer(X_tr, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
 
-                Ws_f_t, bs_f_t = init_feature_layer_torch(Xtr_t.shape[1], npw, NW, rng, DEVICE)
-                Z_t = forward_feature_layer_torch(Xtr_t, Ws_f_t, bs_f_t, SPIKE_STEPS)
-                Ws_h_t, bs_h_t = init_enh_layer_torch(Z_t.shape[1], MP, mw, rng, DEVICE)
-                H_t = forward_enh_layer_torch(Z_t, Ws_h_t, bs_h_t, SPIKE_STEPS)
+            Ws_h, bs_h = init_enh_layer(feat_dim=Z.shape[1], mp_per_win=MP, mw=mw, rng=rng)
+            H = forward_enh_layer(Z, Ws_h, bs_h, steps=SPIKE_STEPS, rng=rng)
 
-                # updater on CPU (NumPy)
-                Z = Z_t.detach().cpu().numpy()
-                H = H_t.detach().cpu().numpy()
-                lam = max(RIDGE, 1e-3)
-                Z_pinv = pinv_ridge_np(Z, lam=lam)
-                A, A_pinv = extend_columns_with_backend("updated_greville", Z, Z_pinv, H, lam=lam)
-                W_out = (A_pinv @ Y_tr).astype(np.float32)
+            # Solve W with updated_greville
+            lam = max(RIDGE, 1e-3)
+            Z_pinv = pinv_ridge_np(Z, lam=lam)
+            A, A_pinv = extend_columns_with_backend("updated_greville", Z, Z_pinv, H, lam=lam)
+            W_out = (A_pinv @ Y_tr).astype(np.float32)
 
-                # eval
-                Zte_t = forward_feature_layer_torch(Xte_t, Ws_f_t, bs_f_t, SPIKE_STEPS)
-                Hte_t = forward_enh_layer_torch(Zte_t, Ws_h_t, bs_h_t, SPIKE_STEPS)
-                At = np.concatenate([Zte_t.detach().cpu().numpy(), Hte_t.detach().cpu().numpy()], axis=1).astype(np.float32)
-                y_pred = np.argmax(At @ W_out, axis=1)
-
-            else:
-                # CPU path
-                Ws_f, bs_f = init_feature_layer(in_dim=X_tr.shape[1], np_per_win=npw, nw=NW, rng=rng)
-                Z = forward_feature_layer(X_tr, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
-                Ws_h, bs_h = init_enh_layer(feat_dim=Z.shape[1], mp_per_win=MP, mw=mw, rng=rng)
-                H = forward_enh_layer(Z, Ws_h, bs_h, steps=SPIKE_STEPS, rng=rng)
-
-                lam = max(RIDGE, 1e-3)
-                Z_pinv = pinv_ridge_np(Z, lam=lam)
-                A, A_pinv = extend_columns_with_backend("updated_greville", Z, Z_pinv, H, lam=lam)
-                W_out = (A_pinv @ Y_tr).astype(np.float32)
-
-                Zt = forward_feature_layer(X_te, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
-                Ht = forward_enh_layer(Zt, Ws_h, bs_h, steps=SPIKE_STEPS, rng=rng)
-                At = np.concatenate([Zt, Ht], axis=1).astype(np.float32)
-                y_pred = np.argmax(At @ W_out, axis=1)
-
+            # Eval
+            Zt = forward_feature_layer(X_te, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
+            Ht = forward_enh_layer(Zt, Ws_h, bs_h, steps=SPIKE_STEPS, rng=rng)
+            At = np.concatenate([Zt, Ht], axis=1).astype(np.float32)
+            y_pred = np.argmax(At @ W_out, axis=1)
             acc = float((y_pred == y_te).mean())
             accs.append(acc)
             rows.append(dict(k=k, seed=seed, acc=acc))
 
         print(f"k={k:6d} | acc={np.mean(accs)*100:5.2f}% ± {np.std(accs)*100:4.2f}")
 
+    # ---- Table (k vs mean accuracy %) ----
     df = pd.DataFrame(rows)
     table = (
         df.groupby("k")["acc"]
@@ -556,7 +447,11 @@ def experiment_2(
     )
     table.to_csv("results/e2_table_accuracy_updated.csv", index=False)
     print("Saved: results/e2_table_accuracy_updated.csv")
+    print("\nE2 — Training size vs Accuracy (%)")
+    for _, r in table.iterrows():
+        print(f"k={int(r['k']):6d} | {r['accuracy_pct']:6.2f}%")
 
+    # ---- Plot: dots + connecting line ----
     x = table["k"].values
     y = table["accuracy_pct"].values
     plt.figure(figsize=(7,4), dpi=140)
@@ -570,11 +465,12 @@ def experiment_2(
     plt.close()
     print("Saved: figures/e2_acc_vs_k_updated.png")
 
-# ===================== E3 ===================== #
+# ========== E3 :  ========== #
+# ========== E3 : Incremental Enhancement Nodes (Column Updates) ========== #
 def experiment_3(
-    seeds=tuple(range(10)),    # 10 runs
+    seeds=tuple(range(10)),    # Kellinger-style: 10 runs
     npw=100,                   # fixed feature size
-    mp=MP,                     # 100 per window
+    mp=MP,                     # 100 per window (reuse your global)
     base_mw=20,
     target_mw=30,
     schedules=dict(
@@ -586,103 +482,87 @@ def experiment_3(
 ):
     """
     E3: Incremental column updates by adding enhancement windows.
-    Compares 'direct', 'greville', 'updated_greville' across schedules.
-    Outputs: rows CSV + per-schedule accuracy curves.
+    Compares 'direct', 'greville', 'updated_greville' across three schedules (V1/V2/V3).
+    Outputs: console summaries + simple plots (accuracy vs total windows) per schedule.
     """
-    ensure_dirs()
+    import os, numpy as np, matplotlib.pyplot as plt, pandas as pd
+    os.makedirs("results", exist_ok=True)
+    os.makedirs("figures", exist_ok=True)
+
     lam = max(RIDGE, 1e-3) if ridge is None else ridge
 
+    # Load MNIST once
     X_tr_full, y_tr_full, X_te, y_te = load_mnist(flatten=True)
     Y_tr_full = to_onehot(y_tr_full, 10)
 
     def make_blocks(feat_dim, inc_list, rng):
+        """Create a list of enhancement-window blocks; each item is (Ws_block, bs_block) for Δmw windows."""
         blocks = []
         for dmw in inc_list:
-            if USE_GPU:
-                # we only need weights (they'll be used for torch or numpy forward)
-                Ws_blk, bs_blk = init_enh_layer(feat_dim=feat_dim, mp_per_win=mp, mw=dmw, rng=rng)
-            else:
-                Ws_blk, bs_blk = init_enh_layer(feat_dim=feat_dim, mp_per_win=mp, mw=dmw, rng=rng)
+            Ws_blk, bs_blk = init_enh_layer(feat_dim=feat_dim, mp_per_win=mp, mw=dmw, rng=rng)
             blocks.append((Ws_blk, bs_blk))
         return blocks
 
+    def forward_enh_with_lists(Z, Ws_list, bs_list, steps, rng):
+        """Concatenate enhancement outputs from all windows in the lists."""
+        return forward_enh_layer(Z, Ws_list, bs_list, steps, rng)
+
+    # Collect all rows for aggregation/plotting
     rows = []  # dict(method, schedule, total_mw, seed, acc, step_time)
 
     print("\n== E3: Incremental Enhancement Nodes (Column Updates) ==")
     for schedule_name, inc_list in schedules.items():
         print(f"\n-- Schedule {schedule_name}: base={base_mw}, increments={inc_list}, target={target_mw} --")
 
+        # For reproducibility across methods, we will (per seed):
+        #   - build Z once
+        #   - build base enhancement windows once
+        #   - pre-generate the same sequence of increment blocks (Ws/bs) and reuse them for all methods
         for seed in seeds:
             set_seed(seed)
             rng = np.random.RandomState(seed)
 
-            # Features (Z) once per seed
-            if USE_GPU:
-                Xtr_t = torch.from_numpy(X_tr_full).to(DEVICE)
-                Xte_t = torch.from_numpy(X_te).to(DEVICE)
-                Ws_f_t, bs_f_t = init_feature_layer_torch(Xtr_t.shape[1], npw, NW, rng, DEVICE)
-                Z_t = forward_feature_layer_torch(Xtr_t, Ws_f_t, bs_f_t, SPIKE_STEPS)
-                Z = Z_t.detach().cpu().numpy()
-            else:
-                Ws_f, bs_f = init_feature_layer(in_dim=X_tr_full.shape[1], np_per_win=npw, nw=NW, rng=rng)
-                Z = forward_feature_layer(X_tr_full, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
+            # Features: Z built once (full 60k)
+            Ws_f, bs_f = init_feature_layer(in_dim=X_tr_full.shape[1], np_per_win=npw, nw=NW, rng=rng)
+            Z = forward_feature_layer(X_tr_full, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
 
-            # Base enhancement windows
+            # Base enhancement windows (mw=base_mw)
             Ws_base, bs_base = init_enh_layer(feat_dim=Z.shape[1], mp_per_win=mp, mw=base_mw, rng=rng)
 
-            # Pre-generate increment blocks
+            # Pre-generate increment blocks and keep them identical for all methods
             blocks = make_blocks(feat_dim=Z.shape[1], inc_list=inc_list, rng=rng)
 
+            # Methods to compare
             for method in ("direct", "greville", "updated_greville"):
-                Ws_cum = list(Ws_base)
+                # Start from base state each time for fairness
+                Ws_cum = list(Ws_base)  # shallow copies are fine (we append lists)
                 bs_cum = list(bs_base)
-                Z_pinv = pinv_ridge_np(Z, lam=lam)  # constant per seed/method
+
+                # We measure step time as: (compute H_cum) + (update A^+) + (solve W)
+                # Z^+ is constant per seed/method (since Z doesn't change)
+                Z_pinv = pinv_ridge_np(Z, lam=lam)
 
                 total_mw_running = base_mw
                 for (Ws_blk, bs_blk) in blocks:
+                    # Append this block
                     Ws_cum += Ws_blk
                     bs_cum += bs_blk
-                    total_mw_running += len(Ws_blk)
+                    total_mw_running += len(Ws_blk)  # Δmw
 
+                    # Step timing
                     with Timer() as t_step:
                         # Build cumulative H
-                        if USE_GPU:
-                            # forward H on GPU for speed, then back to numpy if needed
-                            Z_t = torch.from_numpy(Z).to(DEVICE)
-                            # re-create torch weights for H_cum from numpy weights:
-                            # (fast path: compute H via numpy to keep it simple & consistent)
-                            H_cum = forward_enh_layer(Z, Ws_cum, bs_cum, steps=SPIKE_STEPS, rng=rng)
-                        else:
-                            H_cum = forward_enh_layer(Z, Ws_cum, bs_cum, steps=SPIKE_STEPS, rng=rng)
-
-                        # Update A^+ and solve
+                        H_cum = forward_enh_with_lists(Z, Ws_cum, bs_cum, steps=SPIKE_STEPS, rng=rng)
+                        # Column partition update (or direct recompute)
                         A, A_pinv = extend_columns_with_backend(method, Z, Z_pinv, H_cum, lam=lam)
+                        # Solve and evaluate
                         W_out = (A_pinv @ Y_tr_full).astype(np.float32)
                     step_time = t_step.elapsed
 
                     # Evaluate on test
-                    if USE_GPU:
-                        # compute Zt/Ht with torch if we had torch feature weights
-                        Zt_np = None
-                        if 'Ws_f_t' in locals():
-                            Zt_t = forward_feature_layer_torch(Xte_t, Ws_f_t, bs_f_t, SPIKE_STEPS)
-                            # build torch enh weights from numpy Ws_cum/bs_cum? simplest: reuse numpy path for eval too
-                            Zt_np = Zt_t.detach().cpu().numpy()
-                            Ht = forward_enh_layer(Zt_np, Ws_cum, bs_cum, steps=SPIKE_STEPS, rng=rng)
-                            At = np.concatenate([Zt_np, Ht], axis=1).astype(np.float32)
-                        else:
-                            # fallback to numpy path
-                            if 'Ws_f' in locals():
-                                Zt = forward_feature_layer(X_te, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
-                                Ht = forward_enh_layer(Zt, Ws_cum, bs_cum, steps=SPIKE_STEPS, rng=rng)
-                                At = np.concatenate([Zt, Ht], axis=1).astype(np.float32)
-                            else:
-                                raise RuntimeError("Missing feature weights for eval.")
-                    else:
-                        Zt = forward_feature_layer(X_te, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
-                        Ht = forward_enh_layer(Zt, Ws_cum, bs_cum, steps=SPIKE_STEPS, rng=rng)
-                        At = np.concatenate([Zt, Ht], axis=1).astype(np.float32)
-
+                    Zt = forward_feature_layer(X_te, Ws_f, bs_f, steps=SPIKE_STEPS, rng=rng)
+                    Ht = forward_enh_with_lists(Zt, Ws_cum, bs_cum, steps=SPIKE_STEPS, rng=rng)
+                    At = np.concatenate([Zt, Ht], axis=1).astype(np.float32)
                     y_pred = np.argmax(At @ W_out, axis=1)
                     acc = float((y_pred == y_te).mean())
 
@@ -695,21 +575,24 @@ def experiment_3(
                         step_time=step_time
                     ))
 
-        # summary at final capacity
+        # After finishing all seeds & methods for this schedule, print quick summary at final capacity
         df_sched = pd.DataFrame([r for r in rows if r["schedule"] == schedule_name])
         df_final = df_sched[df_sched["total_mw"] == target_mw]
         print("  Final (mw=30) accuracy mean ± std:")
-        for m in ("direct", "greville", "updated_greville"):
+        for m in ("direct","greville","updated_greville"):
             sub = df_final[df_final["method"] == m]["acc"]
             if not sub.empty:
                 print(f"    {m:16s} {sub.mean()*100:5.2f}% ± {sub.std()*100:4.2f}%")
 
-    # Aggregate & Plot
+    # ---------- Aggregate & Plot (Accuracy vs total windows) ----------
     df = pd.DataFrame(rows)
     df["acc_pct"] = df["acc"] * 100
+
+    # Save a tidy CSV for later analysis
     df.sort_values(["schedule","method","total_mw","seed"]).to_csv("results/e3_rows.csv", index=False)
     print("Saved: results/e3_rows.csv")
 
+    # One figure per schedule
     for schedule_name in schedules.keys():
         d = df[df["schedule"] == schedule_name]
         if d.empty: 
@@ -730,9 +613,11 @@ def experiment_3(
         plt.savefig(f"figures/e3_acc_vs_mw_{schedule_name}.png"); plt.close()
         print(f"Saved: figures/e3_acc_vs_mw_{schedule_name}.png")
 
+    # Optional: summarize cumulative time per schedule/method at final mw
     df_final = df[df["total_mw"] == target_mw]
     if not df_final.empty:
-        print("\nE3 — Final step time (mean ± std) [per-step at final increment]")
+        print("\nE3 — Final mw cumulative step time (mean ± std) [approx; per-step times summed offline if desired]")
+        # quick per-method mean step time at final step (not cumulative)
         for schedule_name in schedules.keys():
             for m in ("direct","greville","updated_greville"):
                 sub = df_final[(df_final["schedule"]==schedule_name) & (df_final["method"]==m)]["step_time"]
@@ -741,10 +626,8 @@ def experiment_3(
 
     print("\n[E3] Done.")
 
-# ---------------- Runner ---------------- #
-if __name__ == "__main__":
-    ensure_dirs()
-    # experiment_1()
-    experiment_2()
-    # experiment_3()
-    # print("Ready. Uncomment an experiment() at the bottom to run.")
+
+# if __name__ == "__main__":
+#     #experiment_1()
+#     #experiment_2()
+#     #experiment_3()
